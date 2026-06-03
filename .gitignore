@@ -1,0 +1,15 @@
+# Secrets
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# macOS
+.DS_Store
+
+# Claude
+.claude/
