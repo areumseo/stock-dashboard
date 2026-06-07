@@ -12,7 +12,7 @@ CRITICAL: Your response must ALWAYS be valid JSON only — no markdown, no code 
 
 Schema: {"items":[{"name":"string","code":"string","summary":"2 sentences: recent news + investment point","metrics":[{"label":"string","value":"string","positive":true|false|null}],"badge":"string","badgeType":"up|new|lev|down"}]}
 
-Rules: items≤10, metrics≤3, use the most recent data available."""
+Rules: items≤20, metrics≤3, use the most recent data available."""
 
 
 class SearchRequest(BaseModel):
@@ -37,7 +37,7 @@ def search(req: SearchRequest):
     client = anthropic.Anthropic(api_key=api_key)
     kwargs = dict(
         model="claude-sonnet-4-5",
-        max_tokens=4000,
+        max_tokens=8000,
         system=system,
         messages=[{"role": "user", "content": req.prompt}],
     )
