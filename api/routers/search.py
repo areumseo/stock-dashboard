@@ -16,7 +16,7 @@ If data is unavailable or uncertain, use approximate values or "N/A" — but NEV
 
 Schema: {"items":[{"name":"string","code":"string","summary":"1 sentence: recent news + key investment point","metrics":[{"label":"string","value":"string","positive":true|false|null}],"badge":"string","badgeType":"up|new|lev|down"}]}
 
-Rules: items≤5, metrics≤3."""
+Rules: items≤20, metrics≤3."""
 
 SYSTEM_PROMPT_QUICK = SYSTEM_PROMPT  # kept for backward compat, quick mode removed
 SYSTEM_PROMPT_FULL  = SYSTEM_PROMPT
