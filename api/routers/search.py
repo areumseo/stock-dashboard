@@ -6,13 +6,13 @@ from pydantic import BaseModel
 
 router = APIRouter()
 
-SYSTEM_PROMPT = """You are a stock information analyst. Search the web for the latest data, then respond with ONLY a raw JSON object.
+SYSTEM_PROMPT = """You are a stock information analyst. Search the web for the latest data, then respond with ONLY newline-delimited JSON (NDJSON).
 
-CRITICAL: Your response must ALWAYS be valid JSON only — no markdown, no code blocks, no explanations, no prose. Even if data is incomplete, output JSON with "N/A" for missing values. Never apologize or explain in text.
+CRITICAL: Output each stock as a SEPARATE JSON object on its own line. Do NOT wrap in an array. No markdown, no code blocks, no explanations. Each line must be independently valid JSON.
 
-Schema: {"items":[{"name":"string","code":"string","summary":"2 sentences: recent news + investment point","metrics":[{"label":"string","value":"string","positive":true|false|null}],"badge":"string","badgeType":"up|new|lev|down"}]}
+Line schema: {"name":"string","code":"string","summary":"2 sentences: recent news + investment point","metrics":[{"label":"string","value":"string","positive":true|false|null}],"badge":"string","badgeType":"up|new|lev|down"}
 
-Rules: items≤20, metrics≤3, use the most recent data available."""
+Rules: up to 20 lines (one stock per line), metrics≤3, use the most recent data available."""
 
 
 class SearchRequest(BaseModel):
