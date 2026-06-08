@@ -16,7 +16,12 @@ Schema: {"items":[{"name":"string","code":"string","summary":"2 sentences: recen
 
 Rules: metrics≤3, use the most recent data available."""
 
-SYSTEM_PROMPT_QUICK = SYSTEM_PROMPT + " Return only the TOP 3 most important items. items≤3."
+SYSTEM_PROMPT_QUICK = SYSTEM_PROMPT + (
+    " Return only the TOP 3 most important items based on your training knowledge."
+    " Do NOT search the web — answer immediately from what you know."
+    " Use approximate values where exact figures are uncertain; never output N/A."
+    " items≤3."
+)
 SYSTEM_PROMPT_FULL  = SYSTEM_PROMPT + " items≤10."
 
 # ── 서버 사이드 캐시 (30분 TTL) ────────────────────────────────────────────────
@@ -71,8 +76,7 @@ def search(req: SearchRequest):
     base_prompt = SYSTEM_PROMPT_QUICK if req.quick else SYSTEM_PROMPT_FULL
     system = base_prompt + f" {lang_instruction}"
 
-    max_tokens  = 600  if req.quick else 2000
-    web_uses    = 1    if req.quick else 2
+    max_tokens = 800 if req.quick else 2000
 
     client = anthropic.Anthropic(api_key=api_key)
     kwargs = dict(
@@ -81,7 +85,10 @@ def search(req: SearchRequest):
         system=system,
         messages=[{"role": "user", "content": req.prompt}],
     )
-    kwargs["tools"] = [{"type": "web_search_20250305", "name": "web_search", "max_uses": web_uses}]
+    # quick=True: 웹 검색 없이 학습 데이터로 즉시 응답 (2-3초)
+    # quick=False: 웹 검색 2회로 최신 실제 데이터 (10-20초)
+    if not req.quick:
+        kwargs["tools"] = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 2}]
 
     def generate():
         collected = []
