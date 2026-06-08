@@ -1,10 +1,12 @@
 import os
 import time
 import hashlib
+import secrets
 import anthropic
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Header
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
+from typing import Optional
 
 router = APIRouter()
 
@@ -51,8 +53,18 @@ class SearchRequest(BaseModel):
     quick: bool = False        # True → 3개 카드 빠르게 (웹 검색 1회)
 
 
+def _check_api_key(x_api_key: Optional[str]) -> None:
+    app_key = os.environ.get("APP_API_KEY")
+    if not app_key:
+        return  # 환경변수 미설정 시 제한 없음 (개발 편의)
+    if not x_api_key or not secrets.compare_digest(x_api_key, app_key):
+        raise HTTPException(status_code=403, detail="Invalid or missing API key")
+
+
 @router.post("")
-def search(req: SearchRequest):
+def search(req: SearchRequest, x_api_key: Optional[str] = Header(default=None)):
+    _check_api_key(x_api_key)
+
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not set")
