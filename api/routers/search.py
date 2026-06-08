@@ -35,9 +35,12 @@ def search(req: SearchRequest):
     system = SYSTEM_PROMPT + f" {lang_instruction}"
 
     client = anthropic.Anthropic(api_key=api_key)
+    # 웹 검색 없는 경우(개별주 시총): haiku로 빠르게
+    # 웹 검색 있는 경우(ETF, 레버리지): sonnet 유지
+    model = "claude-sonnet-4-5" if req.use_websearch else "claude-haiku-4-5"
     kwargs = dict(
-        model="claude-sonnet-4-5",
-        max_tokens=8000,
+        model=model,
+        max_tokens=4000,
         system=system,
         messages=[{"role": "user", "content": req.prompt}],
     )
