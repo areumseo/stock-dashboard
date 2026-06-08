@@ -15,12 +15,34 @@ _cache: dict = {}
 CACHE_TTL = 30 * 60  # 30분
 
 
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
 def _scrape(country: str, top_n: int) -> list:
     url = URLS.get(country)
     if not url:
         raise ValueError(f"Unknown country: {country}")
-    resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-    resp.raise_for_status()
+
+    # 최대 3회 재시도
+    last_err = None
+    for attempt in range(3):
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=15)
+            resp.raise_for_status()
+            break
+        except Exception as e:
+            last_err = e
+            time.sleep(1.5 * (attempt + 1))
+    else:
+        raise last_err
     soup = BeautifulSoup(resp.text, "html.parser")
     stocks = []
     for row in soup.select("table tbody tr")[:top_n]:
