@@ -12,7 +12,7 @@ CRITICAL: Your response must ALWAYS be valid JSON only — no markdown, no code 
 
 Schema: {"items":[{"name":"string","code":"string","summary":"2 sentences: recent news + investment point","metrics":[{"label":"string","value":"string","positive":true|false|null}],"badge":"string","badgeType":"up|new|lev|down"}]}
 
-Rules: items≤20, metrics≤3, use the most recent data available."""
+Rules: items≤10, metrics≤3, use the most recent data available."""
 
 
 class SearchRequest(BaseModel):
