@@ -73,7 +73,7 @@ def search(req: SearchRequest):
     base_prompt = SYSTEM_PROMPT_QUICK if req.quick else SYSTEM_PROMPT_FULL
     system = base_prompt + f" {lang_instruction}"
 
-    max_tokens = 800 if req.quick else 2000
+    max_tokens = 800 if req.quick else 6000
 
     client = anthropic.Anthropic(api_key=api_key)
     kwargs = dict(
