@@ -12,17 +12,12 @@ SYSTEM_PROMPT = """You are a stock information analyst. Search the web for the l
 
 CRITICAL: Your response must ALWAYS be valid JSON only — no markdown, no code blocks, no explanations, no prose. Even if data is incomplete, output JSON with "N/A" for missing values. Never apologize or explain in text.
 
-Schema: {"items":[{"name":"string","code":"string","summary":"2 sentences: recent news + investment point","metrics":[{"label":"string","value":"string","positive":true|false|null}],"badge":"string","badgeType":"up|new|lev|down"}]}
+Schema: {"items":[{"name":"string","code":"string","summary":"1 concise sentence covering recent news and key investment point","metrics":[{"label":"string","value":"string","positive":true|false|null}],"badge":"string","badgeType":"up|new|lev|down"}]}
 
-Rules: metrics≤3, use the most recent data available."""
+Rules: items≤5, metrics≤3, use the most recent data available."""
 
-SYSTEM_PROMPT_QUICK = SYSTEM_PROMPT + (
-    " Return only the TOP 3 most important items based on your training knowledge."
-    " Do NOT search the web — answer immediately from what you know."
-    " Use approximate values where exact figures are uncertain; never output N/A."
-    " items≤3."
-)
-SYSTEM_PROMPT_FULL  = SYSTEM_PROMPT + " items≤10."
+SYSTEM_PROMPT_QUICK = SYSTEM_PROMPT  # kept for backward compat, quick mode removed
+SYSTEM_PROMPT_FULL  = SYSTEM_PROMPT
 
 # ── 서버 사이드 캐시 (30분 TTL) ────────────────────────────────────────────────
 _cache: dict[str, tuple[float, str]] = {}  # key → (timestamp, full_response)
