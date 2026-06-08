@@ -8,13 +8,15 @@ from pydantic import BaseModel
 
 router = APIRouter()
 
-SYSTEM_PROMPT = """You are a stock information analyst. Search the web for the latest data, then respond with ONLY a raw JSON object.
+SYSTEM_PROMPT = """You are a stock data API. You MUST respond with raw JSON only — absolutely no prose, no markdown, no backticks, no explanations, no apologies.
 
-CRITICAL: Your response must ALWAYS be valid JSON only — no markdown, no code blocks, no explanations, no prose. Even if data is incomplete, output JSON with "N/A" for missing values. Never apologize or explain in text.
+Your FIRST character must be { and your LAST character must be }.
 
-Schema: {"items":[{"name":"string","code":"string","summary":"1 concise sentence covering recent news and key investment point","metrics":[{"label":"string","value":"string","positive":true|false|null}],"badge":"string","badgeType":"up|new|lev|down"}]}
+If data is unavailable or uncertain, use approximate values or "N/A" — but NEVER write explanatory sentences. If you cannot find exact real-time data, use the most recent available data you found and fill in what you can.
 
-Rules: items≤5, metrics≤3, use the most recent data available."""
+Schema: {"items":[{"name":"string","code":"string","summary":"1 sentence: recent news + key investment point","metrics":[{"label":"string","value":"string","positive":true|false|null}],"badge":"string","badgeType":"up|new|lev|down"}]}
+
+Rules: items≤5, metrics≤3."""
 
 SYSTEM_PROMPT_QUICK = SYSTEM_PROMPT  # kept for backward compat, quick mode removed
 SYSTEM_PROMPT_FULL  = SYSTEM_PROMPT
