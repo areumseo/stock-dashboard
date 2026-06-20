@@ -1,8 +1,11 @@
+from __future__ import annotations
+
 import os
 import time
 import hashlib
 import secrets
 import json
+import threading
 import requests
 import anthropic
 import yfinance as yf
@@ -27,26 +30,39 @@ Schema: {"items":[{"name":"string","code":"string","summary":"1 sentence: recent
 
 Rules: items≤20. Use the exact ticker code (e.g. 005930 for Samsung, AAPL for Apple). Do NOT include metrics — they are fetched separately."""
 
-# ── 서버 사이드 캐시 (30분 TTL) ────────────────────────────────────────────────
-_cache: dict[str, tuple[float, str]] = {}
-CACHE_TTL = 30 * 60
+# ── 2단 캐시 (B′) ──────────────────────────────────────────────────────────────
+# 비싼 Claude 결과(종목 리스트+요약)는 길게 캐시하고, 가격 수치는 매 요청마다 실시간으로
+# 다시 붙인다. 덕분에 요약은 반나절 신선 + 수치는 항상 실시간 + 응답은 2~3초.
+_list_cache: dict[str, tuple[float, list[dict]]] = {}  # key → (ts, bare items[no metrics])
+LIST_TTL = 6 * 3600          # Claude 리스트 캐시 6시간
+ACTIVE_WINDOW = 24 * 3600    # 최근 24시간 내 요청된 쿼리만 프리워밍
+REFRESH_MARGIN = 15 * 60     # 만료 15분 전에 미리 갱신 → 활성 쿼리는 항상 따뜻함
+PREWARM_INTERVAL = 5 * 60    # 프리워밍 점검 주기
+
+_lock = threading.Lock()
+_known: dict[str, dict] = {}  # key → {prompt, lang, last_access}
+
+# 첫 화면(한국·시총·전체)과 미국 기본 화면은 부팅 직후부터 따뜻하게
+_SEED_QUERIES = [
+    ("한국 시가총액 상위 20개 종목을 웹에서 검색해서 최근 이슈와 투자 포인트를 정리해주세요. 정확히 20개 항목을 반환하세요.", "ko"),
+    ("미국 시가총액 상위 20개 종목을 웹에서 검색해서 최근 이슈와 투자 포인트를 정리해주세요. 정확히 20개 항목을 반환하세요.", "ko"),
+]
 
 
 def _cache_key(prompt: str, lang: str) -> str:
     return hashlib.md5(f"{prompt}|{lang}".encode()).hexdigest()
 
 
-def _get_cached(key: str) -> str | None:
-    if key in _cache:
-        ts, data = _cache[key]
-        if time.time() - ts < CACHE_TTL:
-            return data
-        del _cache[key]
+def _get_cached_items(key: str) -> Optional[list[dict]]:
+    entry = _list_cache.get(key)
+    if entry and time.time() - entry[0] < LIST_TTL:
+        return entry[1]
     return None
 
 
-def _set_cache(key: str, data: str) -> None:
-    _cache[key] = (time.time(), data)
+def _record_access(key: str, prompt: str, lang: str) -> None:
+    with _lock:
+        _known[key] = {"prompt": prompt, "lang": lang, "last_access": time.time()}
 
 
 # ── yfinance 실시간 메트릭 조회 ───────────────────────────────────────────────
@@ -190,6 +206,82 @@ def _extract_next_item(s: str) -> Optional[tuple[dict, str]]:
         search_from = name_idx + 1
 
 
+# ── Claude 호출: bare item(수치 없음) 스트리밍 ─────────────────────────────────
+
+def _claude_items(prompt: str, lang: str):
+    """Claude 웹 검색으로 종목 리스트를 생성, 완성된 item dict를 순서대로 yield (metrics 없음)."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY not set")
+
+    lang_instruction = (
+        "Write name, summary, badge in Korean."
+        if lang == "ko"
+        else "Write name, summary, badge in English."
+    )
+    system = SYSTEM_PROMPT + f" {lang_instruction}"
+
+    client = anthropic.Anthropic(api_key=api_key)
+    buffer = ""
+    with client.messages.stream(
+        model="claude-sonnet-4-5",
+        max_tokens=4000,
+        system=system,
+        messages=[{"role": "user", "content": prompt}],
+        tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 2}],
+    ) as stream:
+        for text in stream.text_stream:
+            buffer += text
+            while True:
+                result = _extract_next_item(buffer)
+                if result is None:
+                    break
+                item, buffer = result
+                item.pop("metrics", None)  # 수치는 캐시하지 않음 (항상 실시간)
+                yield item
+
+
+def _enrich(item: dict, is_korean: bool) -> str:
+    """bare item에 실시간 metrics를 붙여 JSON 문자열로. (캐시 원본은 건드리지 않음)"""
+    out = dict(item)
+    out["metrics"] = _fetch_real_metrics(out.get("code", ""), is_korean)
+    return json.dumps(out, ensure_ascii=False)
+
+
+# ── 프리워밍: 활성 쿼리를 만료 전에 미리 갱신 ────────────────────────────────────
+
+def _prewarm_loop():
+    # 시드 쿼리를 활성 목록에 등록 → 부팅 직후 첫 사이클에 따뜻해짐
+    for prompt, lang in _SEED_QUERIES:
+        _record_access(_cache_key(prompt, lang), prompt, lang)
+
+    while True:
+        try:
+            now = time.time()
+            with _lock:
+                snapshot = list(_known.items())
+            for key, meta in snapshot:
+                if now - meta["last_access"] > ACTIVE_WINDOW:
+                    continue
+                entry = _list_cache.get(key)
+                age = now - entry[0] if entry else float("inf")
+                if age <= LIST_TTL - REFRESH_MARGIN:
+                    continue
+                try:
+                    fresh = list(_claude_items(meta["prompt"], meta["lang"]))
+                    if fresh:
+                        with _lock:
+                            _list_cache[key] = (time.time(), fresh)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        time.sleep(PREWARM_INTERVAL)
+
+
+threading.Thread(target=_prewarm_loop, daemon=True).start()
+
+
 # ── API ───────────────────────────────────────────────────────────────────────
 
 class SearchRequest(BaseModel):
@@ -211,52 +303,30 @@ def _check_api_key(x_api_key: Optional[str]) -> None:
 def search(req: SearchRequest, x_api_key: Optional[str] = Header(default=None)):
     _check_api_key(x_api_key)
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
+    if not os.environ.get("ANTHROPIC_API_KEY"):
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not set")
 
     key = _cache_key(req.prompt, req.lang)
-
-    cached = _get_cached(key)
-    if cached:
-        return StreamingResponse(iter([cached]), media_type="text/plain")
-
-    lang_instruction = (
-        "Write name, summary, badge in Korean."
-        if req.lang == "ko"
-        else "Write name, summary, badge in English."
-    )
-    system = SYSTEM_PROMPT + f" {lang_instruction}"
-
-    client = anthropic.Anthropic(api_key=api_key)
-    kwargs = dict(
-        model="claude-sonnet-4-5",
-        max_tokens=4000,
-        system=system,
-        messages=[{"role": "user", "content": req.prompt}],
-        tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 2}],
-    )
-
+    _record_access(key, req.prompt, req.lang)
     is_korean = req.lang == "ko"
 
     def generate():
-        buffer = ""
-        collected = []
         try:
-            with client.messages.stream(**kwargs) as stream:
-                for text in stream.text_stream:
-                    buffer += text
-                    while True:
-                        result = _extract_next_item(buffer)
-                        if result is None:
-                            break
-                        item, buffer = result
-                        # 실시간 가격으로 metrics 교체
-                        item["metrics"] = _fetch_real_metrics(item.get("code", ""), is_korean)
-                        enriched = json.dumps(item, ensure_ascii=False)
-                        collected.append(enriched)
-                        yield enriched
-            _set_cache(key, "".join(collected))
+            cached = _get_cached_items(key)
+            if cached is not None:
+                # 캐시 히트: 저장된 리스트 + 실시간 수치 (Claude 호출 없음, 2~3초)
+                for item in cached:
+                    yield _enrich(item, is_korean)
+                return
+
+            # 캐시 미스: Claude 스트리밍 + 실시간 수치, 완료 후 리스트 캐시 저장
+            collected = []
+            for item in _claude_items(req.prompt, req.lang):
+                collected.append(item)
+                yield _enrich(item, is_korean)
+            if collected:
+                with _lock:
+                    _list_cache[key] = (time.time(), collected)
         except anthropic.RateLimitError:
             yield '{"error":"rate_limit"}'
         except Exception as e:
