@@ -2,35 +2,32 @@ import os
 import time
 import hashlib
 import secrets
+import json
 import anthropic
+import yfinance as yf
 from fastapi import APIRouter, HTTPException, Header
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional
 
 router = APIRouter()
 
+# Claude generates name/code/summary/badge only — no price metrics (yfinance handles those)
 SYSTEM_PROMPT = """You are a stock data API. You MUST respond with raw JSON only — absolutely no prose, no markdown, no backticks, no explanations, no apologies.
 
 Your FIRST character must be { and your LAST character must be }.
 
-If data is unavailable or uncertain, use approximate values or "N/A" — but NEVER write explanatory sentences. If you cannot find exact real-time data, use the most recent available data you found and fill in what you can.
+Schema: {"items":[{"name":"string","code":"string","summary":"1 sentence: recent news + key investment point","badge":"string","badgeType":"up|new|lev|down"}]}
 
-Schema: {"items":[{"name":"string","code":"string","summary":"1 sentence: recent news + key investment point","metrics":[{"label":"string","value":"string","positive":true|false|null}],"badge":"string","badgeType":"up|new|lev|down"}]}
-
-Rules: items≤20, metrics≤3."""
-
-SYSTEM_PROMPT_QUICK = SYSTEM_PROMPT  # kept for backward compat, quick mode removed
-SYSTEM_PROMPT_FULL  = SYSTEM_PROMPT
+Rules: items≤20. Use the exact ticker code (e.g. 005930 for Samsung, AAPL for Apple). Do NOT include metrics — they are fetched separately."""
 
 # ── 서버 사이드 캐시 (30분 TTL) ────────────────────────────────────────────────
-_cache: dict[str, tuple[float, str]] = {}  # key → (timestamp, full_response)
-CACHE_TTL = 30 * 60  # 30분
+_cache: dict[str, tuple[float, str]] = {}
+CACHE_TTL = 30 * 60
 
 
 def _cache_key(prompt: str, lang: str) -> str:
-    raw = f"{prompt}|{lang}"
-    return hashlib.md5(raw.encode()).hexdigest()
+    return hashlib.md5(f"{prompt}|{lang}".encode()).hexdigest()
 
 
 def _get_cached(key: str) -> str | None:
@@ -46,17 +43,140 @@ def _set_cache(key: str, data: str) -> None:
     _cache[key] = (time.time(), data)
 
 
+# ── yfinance 실시간 메트릭 조회 ───────────────────────────────────────────────
+
+def _fmt_krw(value: float) -> str:
+    if value >= 1e12:
+        return f"₩{value / 1e12:.1f}조"
+    if value >= 1e8:
+        return f"₩{value / 1e8:.0f}억"
+    return f"₩{value:,.0f}"
+
+
+def _fmt_usd_cap(value: float) -> str:
+    if value >= 1e12:
+        return f"${value / 1e12:.2f}T"
+    if value >= 1e9:
+        return f"${value / 1e9:.1f}B"
+    return f"${value / 1e6:.0f}M"
+
+
+def _fetch_real_metrics(code: str, is_korean: bool) -> list[dict]:
+    if not code:
+        return []
+    try:
+        if is_korean:
+            ticker = None
+            for suffix in [".KS", ".KQ"]:
+                t = yf.Ticker(code + suffix)
+                fi = t.fast_info
+                if fi.last_price:
+                    ticker = t
+                    break
+            if ticker is None:
+                return []
+        else:
+            ticker = yf.Ticker(code)
+
+        fi = ticker.fast_info
+        metrics = []
+
+        price = fi.last_price
+        prev_close = fi.previous_close
+        market_cap = fi.market_cap
+
+        if price:
+            label = "현재가" if is_korean else "Price"
+            value = f"₩{price:,.0f}" if is_korean else f"${price:,.2f}"
+            metrics.append({"label": label, "value": value, "positive": None})
+
+        if price and prev_close and prev_close > 0:
+            chg = (price - prev_close) / prev_close * 100
+            sign = "+" if chg >= 0 else ""
+            label = "등락률" if is_korean else "Change"
+            metrics.append({"label": label, "value": f"{sign}{chg:.2f}%", "positive": chg >= 0})
+
+        if market_cap:
+            label = "시가총액" if is_korean else "Mkt Cap"
+            value = _fmt_krw(market_cap) if is_korean else _fmt_usd_cap(market_cap)
+            metrics.append({"label": label, "value": value, "positive": None})
+
+        return metrics
+    except Exception:
+        return []
+
+
+# ── 스트리밍 버퍼에서 완성된 item 추출 (Flutter의 brace-counter와 동일 로직) ──
+
+def _matching_brace(s: str, start: int) -> int:
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(s)):
+        if esc:
+            esc = False
+            continue
+        c = s[i]
+        if c == "\\" and in_str:
+            esc = True
+            continue
+        if c == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def _extract_next_item(s: str) -> Optional[tuple[dict, str]]:
+    search_from = 0
+    while True:
+        name_idx = s.find('"name"', search_from)
+        if name_idx == -1:
+            return None
+        brace_start = -1
+        for i in range(name_idx - 1, -1, -1):
+            c = s[i]
+            if c == "{":
+                brace_start = i
+                break
+            if c in ("[", "]", "}"):
+                break
+        if brace_start == -1:
+            search_from = name_idx + 1
+            continue
+        brace_end = _matching_brace(s, brace_start)
+        if brace_end == -1:
+            return None
+        candidate = s[brace_start : brace_end + 1]
+        try:
+            data = json.loads(candidate)
+            if "name" in data and "summary" in data:
+                return data, s[brace_end + 1 :]
+        except json.JSONDecodeError:
+            pass
+        search_from = name_idx + 1
+
+
+# ── API ───────────────────────────────────────────────────────────────────────
+
 class SearchRequest(BaseModel):
     prompt: str
-    lang: str = "ko"          # "ko" | "en"
+    lang: str = "ko"
     use_websearch: bool = True
-    quick: bool = False        # True → 3개 카드 빠르게 (웹 검색 1회)
+    quick: bool = False
 
 
 def _check_api_key(x_api_key: Optional[str]) -> None:
     app_key = os.environ.get("APP_API_KEY")
     if not app_key:
-        return  # 환경변수 미설정 시 제한 없음 (개발 편의)
+        return
     if not x_api_key or not secrets.compare_digest(x_api_key, app_key):
         raise HTTPException(status_code=403, detail="Invalid or missing API key")
 
@@ -71,44 +191,46 @@ def search(req: SearchRequest, x_api_key: Optional[str] = Header(default=None)):
 
     key = _cache_key(req.prompt, req.lang)
 
-    # ── 캐시 히트: 즉시 반환 ────────────────────────────────────────────────
     cached = _get_cached(key)
     if cached:
         return StreamingResponse(iter([cached]), media_type="text/plain")
 
-    # ── 캐시 미스: Claude 호출 ───────────────────────────────────────────────
     lang_instruction = (
-        "Write all text fields (name, summary, badge, label) in Korean."
+        "Write name, summary, badge in Korean."
         if req.lang == "ko"
-        else "Write all text fields in English."
+        else "Write name, summary, badge in English."
     )
-    base_prompt = SYSTEM_PROMPT_QUICK if req.quick else SYSTEM_PROMPT_FULL
-    system = base_prompt + f" {lang_instruction}"
-
-    max_tokens = 800 if req.quick else 6000
+    system = SYSTEM_PROMPT + f" {lang_instruction}"
 
     client = anthropic.Anthropic(api_key=api_key)
     kwargs = dict(
         model="claude-sonnet-4-5",
-        max_tokens=max_tokens,
+        max_tokens=4000,
         system=system,
         messages=[{"role": "user", "content": req.prompt}],
+        tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 2}],
     )
-    # quick=True: 웹 검색 없이 학습 데이터로 즉시 응답 (2-3초)
-    # quick=False: 웹 검색 2회로 최신 실제 데이터 (10-20초)
-    if not req.quick:
-        kwargs["tools"] = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 2}]
+
+    is_korean = req.lang == "ko"
 
     def generate():
+        buffer = ""
         collected = []
         try:
             with client.messages.stream(**kwargs) as stream:
                 for text in stream.text_stream:
-                    collected.append(text)
-                    yield text
-            # quick 요청은 캐시 저장 안 함 (full 결과만 캐시)
-            if not req.quick:
-                _set_cache(key, "".join(collected))
+                    buffer += text
+                    while True:
+                        result = _extract_next_item(buffer)
+                        if result is None:
+                            break
+                        item, buffer = result
+                        # 실시간 가격으로 metrics 교체
+                        item["metrics"] = _fetch_real_metrics(item.get("code", ""), is_korean)
+                        enriched = json.dumps(item, ensure_ascii=False)
+                        collected.append(enriched)
+                        yield enriched
+            _set_cache(key, "".join(collected))
         except anthropic.RateLimitError:
             yield '{"error":"rate_limit"}'
         except Exception as e:
