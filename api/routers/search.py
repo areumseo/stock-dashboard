@@ -287,8 +287,14 @@ def _extract_next_item(s: str) -> Optional[tuple[dict, str]]:
 
 # ── Claude 호출: bare item(수치 없음) 스트리밍 ─────────────────────────────────
 
-def _claude_items(prompt: str, lang: str):
-    """Claude 웹 검색으로 종목 리스트를 생성, 완성된 item dict를 순서대로 yield (metrics 없음)."""
+# 기본은 Haiku(저렴). 단순 검색(시총·대형 ETF)은 잘 처리하지만, 어려운 검색
+# (신규상장·레버리지 ETF 등)에서 빈 배열을 반환할 때가 있어 Sonnet으로 폴백한다.
+MODEL_PRIMARY = "claude-haiku-4-5-20251001"
+MODEL_FALLBACK = "claude-sonnet-4-5"
+
+
+def _claude_items_model(prompt: str, lang: str, model: str):
+    """주어진 모델로 종목 리스트를 생성, 완성된 item dict를 순서대로 yield (metrics 없음)."""
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY not set")
@@ -303,9 +309,7 @@ def _claude_items(prompt: str, lang: str):
     client = anthropic.Anthropic(api_key=api_key)
     buffer = ""
     with client.messages.stream(
-        # 수치는 네이버에서 가져오므로 Claude는 리스트+1줄 요약만 담당 → Haiku로 충분.
-        # Sonnet 대비 토큰 단가 약 1/3.
-        model="claude-haiku-4-5-20251001",
+        model=model,
         max_tokens=4000,
         system=system,
         messages=[{"role": "user", "content": prompt}],
@@ -320,6 +324,17 @@ def _claude_items(prompt: str, lang: str):
                 item, buffer = result
                 item.pop("metrics", None)  # 수치는 캐시하지 않음 (항상 실시간)
                 yield item
+
+
+def _claude_items(prompt: str, lang: str):
+    """Haiku로 먼저 시도, 0개면 Sonnet으로 폴백. (어려운 ETF 검색 안정성 확보)"""
+    count = 0
+    for item in _claude_items_model(prompt, lang, MODEL_PRIMARY):
+        count += 1
+        yield item
+    if count == 0:
+        for item in _claude_items_model(prompt, lang, MODEL_FALLBACK):
+            yield item
 
 
 def _enrich(item: dict, lang: str) -> str:
