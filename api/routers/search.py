@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 import hashlib
 import secrets
@@ -77,6 +78,29 @@ def _labels(lang: str) -> tuple[str, str, str]:
     if lang == "ko":
         return ("현재가", "등락률", "시가총액")
     return ("Price", "Change", "Mkt Cap")
+
+
+def _parse_kr_amount(s: str) -> Optional[float]:
+    """네이버 '4조 3,770억' / '8,714억' → 숫자 (조=1e12, 억=1e8)."""
+    s = s.replace(",", "").replace("USD", "").strip()
+    total = 0.0
+    m = re.search(r"([\d.]+)\s*조", s)
+    if m:
+        total += float(m.group(1)) * 1e12
+    m = re.search(r"([\d.]+)\s*억", s)
+    if m:
+        total += float(m.group(1)) * 1e8
+    return total or None
+
+
+def _fmt_usd_cap(v: float) -> str:
+    if v >= 1e12:
+        return f"${v / 1e12:.2f}T"
+    if v >= 1e9:
+        return f"${v / 1e9:.1f}B"
+    if v >= 1e6:
+        return f"${v / 1e6:.0f}M"
+    return f"${v:,.0f}"
 
 
 def _naver_basic(reuters_code: str) -> dict:
@@ -168,7 +192,12 @@ def _fetch_naver_us_metrics(ticker: str, lang: str) -> list[dict]:
 
     for info in basic.get("stockItemTotalInfos", []):
         if info.get("code") == "marketValue" and info.get("value"):
-            metrics.append({"label": cap_l, "value": info["value"], "positive": None})
+            cap = info["value"]  # 네이버 표기 예: "4조 3,770억 USD"
+            if lang != "ko":
+                num = _parse_kr_amount(cap)
+                if num:
+                    cap = _fmt_usd_cap(num)  # "$4.38T"
+            metrics.append({"label": cap_l, "value": cap, "positive": None})
             break
 
     return metrics
