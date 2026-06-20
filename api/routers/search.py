@@ -103,6 +103,15 @@ def _fmt_usd_cap(v: float) -> str:
     return f"${v:,.0f}"
 
 
+def _fmt_krw_cap(v: float) -> str:
+    """영어 모드용 원화 시총 표기 (한글 단위 없이): ₩2,070T / ₩583B."""
+    if v >= 1e12:
+        return f"₩{v / 1e12:,.0f}T"
+    if v >= 1e9:
+        return f"₩{v / 1e9:,.0f}B"
+    return f"₩{v:,.0f}"
+
+
 def _naver_basic(reuters_code: str) -> dict:
     return requests.get(
         f"https://api.stock.naver.com/stock/{reuters_code}/basic",
@@ -139,7 +148,12 @@ def _fetch_naver_kr_metrics(code: str, lang: str) -> list[dict]:
         ).json()
         for info in integ.get("totalInfos", []):
             if info.get("code") == "marketValue":
-                metrics.append({"label": cap_l, "value": info.get("value", "N/A"), "positive": None})
+                cap = info.get("value", "N/A")  # 네이버 표기 예: "2,069조 5,826억"
+                if lang != "ko":
+                    num = _parse_kr_amount(cap)
+                    if num:
+                        cap = _fmt_krw_cap(num)  # "₩2,070T"
+                metrics.append({"label": cap_l, "value": cap, "positive": None})
                 break
     except Exception:
         pass
