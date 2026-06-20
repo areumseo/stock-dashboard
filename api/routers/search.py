@@ -9,7 +9,6 @@ import queue
 import threading
 import requests
 import anthropic
-import yfinance as yf
 from fastapi import APIRouter, HTTPException, Header
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -22,7 +21,7 @@ _NAVER_HEADERS = {
     "Referer": "https://m.stock.naver.com/",
 }
 
-# Claude generates name/code/summary/badge only — no price metrics (yfinance handles those)
+# Claude generates name/code/summary/badge only — prices come from Naver (fetched separately)
 SYSTEM_PROMPT = """You are a stock data API. You MUST respond with raw JSON only — absolutely no prose, no markdown, no backticks, no explanations, no apologies.
 
 Your FIRST character must be { and your LAST character must be }.
@@ -66,18 +65,30 @@ def _record_access(key: str, prompt: str, lang: str) -> None:
         _known[key] = {"prompt": prompt, "lang": lang, "last_access": time.time()}
 
 
-# ── yfinance 실시간 메트릭 조회 ───────────────────────────────────────────────
+# ── 네이버 증권 실시간 메트릭 (한국·미국 모두) ───────────────────────────────
+# 라우팅은 언어가 아니라 종목 코드 형식으로 판단: 6자리 숫자 = 한국, 그 외 = 미국 티커.
+# 모든 수치는 네이버에서 직접 — 링크 클릭 시 보이는 화면과 동일하고, yfinance처럼
+# 클라우드 IP가 차단당하지 않음.
 
-def _fmt_usd_cap(value: float) -> str:
-    if value >= 1e12:
-        return f"${value / 1e12:.2f}T"
-    if value >= 1e9:
-        return f"${value / 1e9:.1f}B"
-    return f"${value / 1e6:.0f}M"
+_us_code_cache: dict[str, Optional[str]] = {}  # 미국 티커 → 네이버 reutersCode (정적)
 
 
-def _fetch_naver_metrics(code: str) -> list[dict]:
-    """한국 주식: 네이버 증권 모바일 API (링크 클릭 시 보이는 화면과 동일 수치)."""
+def _labels(lang: str) -> tuple[str, str, str]:
+    if lang == "ko":
+        return ("현재가", "등락률", "시가총액")
+    return ("Price", "Change", "Mkt Cap")
+
+
+def _naver_basic(reuters_code: str) -> dict:
+    return requests.get(
+        f"https://api.stock.naver.com/stock/{reuters_code}/basic",
+        headers=_NAVER_HEADERS, timeout=4,
+    ).json()
+
+
+def _fetch_naver_kr_metrics(code: str, lang: str) -> list[dict]:
+    """한국 주식: basic(가격·등락) + integration(시총)."""
+    price_l, chg_l, cap_l = _labels(lang)
     try:
         basic = requests.get(
             f"https://m.stock.naver.com/api/stock/{code}/basic",
@@ -87,20 +98,16 @@ def _fetch_naver_metrics(code: str) -> list[dict]:
         return []
 
     metrics = []
-
     close = basic.get("closePrice")
     ratio = basic.get("fluctuationsRatio")
-    direction = (basic.get("compareToPreviousPrice") or {}).get("name")  # RISING/FALLING
-    up = direction == "RISING"
+    up = (basic.get("compareToPreviousPrice") or {}).get("name") == "RISING"
 
     if close:
-        metrics.append({"label": "현재가", "value": f"₩{close}", "positive": None})
-
+        metrics.append({"label": price_l, "value": f"₩{close}", "positive": None})
     if ratio not in (None, ""):
         sign = "+" if not str(ratio).startswith("-") else ""
-        metrics.append({"label": "등락률", "value": f"{sign}{ratio}%", "positive": up})
+        metrics.append({"label": chg_l, "value": f"{sign}{ratio}%", "positive": up})
 
-    # 시가총액은 integration 엔드포인트에서
     try:
         integ = requests.get(
             f"https://m.stock.naver.com/api/stock/{code}/integration",
@@ -108,9 +115,7 @@ def _fetch_naver_metrics(code: str) -> list[dict]:
         ).json()
         for info in integ.get("totalInfos", []):
             if info.get("code") == "marketValue":
-                metrics.append(
-                    {"label": "시가총액", "value": info.get("value", "N/A"), "positive": None}
-                )
+                metrics.append({"label": cap_l, "value": info.get("value", "N/A"), "positive": None})
                 break
     except Exception:
         pass
@@ -118,35 +123,64 @@ def _fetch_naver_metrics(code: str) -> list[dict]:
     return metrics
 
 
-def _fetch_yfinance_metrics(code: str) -> list[dict]:
-    """미국 주식: yfinance."""
+def _resolve_us_code(ticker: str) -> Optional[str]:
+    """미국 티커 → 네이버 reutersCode (AAPL→AAPL.O, JPM→JPM 등). 정적이라 캐시."""
+    if ticker in _us_code_cache:
+        return _us_code_cache[ticker]
+    code = None
     try:
-        fi = yf.Ticker(code).fast_info
-        metrics = []
-        price = fi.last_price
-        prev_close = fi.previous_close
-        market_cap = fi.market_cap
+        r = requests.get(
+            "https://ac.stock.naver.com/ac",
+            params={"q": ticker, "target": "stock,etf", "st": 111},
+            headers=_NAVER_HEADERS, timeout=4,
+        ).json()
+        for it in r.get("items", []):
+            if it.get("nationCode") == "USA" and it.get("reutersCode"):
+                code = it["reutersCode"]
+                break
+    except Exception:
+        pass
+    _us_code_cache[ticker] = code
+    return code
 
-        if price:
-            metrics.append({"label": "Price", "value": f"${price:,.2f}", "positive": None})
 
-        if price and prev_close and prev_close > 0:
-            chg = (price - prev_close) / prev_close * 100
-            sign = "+" if chg >= 0 else ""
-            metrics.append({"label": "Change", "value": f"{sign}{chg:.2f}%", "positive": chg >= 0})
-
-        if market_cap:
-            metrics.append({"label": "Mkt Cap", "value": _fmt_usd_cap(market_cap), "positive": None})
-
-        return metrics
+def _fetch_naver_us_metrics(ticker: str, lang: str) -> list[dict]:
+    """미국 주식·ETF: autocomplete로 코드 해석 후 basic 한 번에 가격·등락·시총."""
+    price_l, chg_l, cap_l = _labels(lang)
+    code = _resolve_us_code(ticker)
+    if not code:
+        return []
+    try:
+        basic = _naver_basic(code)
     except Exception:
         return []
 
+    metrics = []
+    close = basic.get("closePrice")
+    ratio = basic.get("fluctuationsRatio")
+    up = (basic.get("compareToPreviousPrice") or {}).get("name") == "RISING"
 
-def _fetch_real_metrics(code: str, is_korean: bool) -> list[dict]:
+    if close:
+        metrics.append({"label": price_l, "value": f"${close}", "positive": None})
+    if ratio not in (None, ""):
+        sign = "+" if not str(ratio).startswith("-") else ""
+        metrics.append({"label": chg_l, "value": f"{sign}{ratio}%", "positive": up})
+
+    for info in basic.get("stockItemTotalInfos", []):
+        if info.get("code") == "marketValue" and info.get("value"):
+            metrics.append({"label": cap_l, "value": info["value"], "positive": None})
+            break
+
+    return metrics
+
+
+def _fetch_real_metrics(code: str, lang: str) -> list[dict]:
     if not code:
         return []
-    return _fetch_naver_metrics(code) if is_korean else _fetch_yfinance_metrics(code)
+    # 6자리 숫자 코드 = 한국 종목, 그 외(알파벳 티커) = 미국 종목
+    if code.isdigit():
+        return _fetch_naver_kr_metrics(code, lang)
+    return _fetch_naver_us_metrics(code, lang)
 
 
 # ── 스트리밍 버퍼에서 완성된 item 추출 (Flutter의 brace-counter와 동일 로직) ──
@@ -242,10 +276,10 @@ def _claude_items(prompt: str, lang: str):
                 yield item
 
 
-def _enrich(item: dict, is_korean: bool) -> str:
+def _enrich(item: dict, lang: str) -> str:
     """bare item에 실시간 metrics를 붙여 JSON 문자열로. (캐시 원본은 건드리지 않음)"""
     out = dict(item)
-    out["metrics"] = _fetch_real_metrics(out.get("code", ""), is_korean)
+    out["metrics"] = _fetch_real_metrics(out.get("code", ""), lang)
     return json.dumps(out, ensure_ascii=False)
 
 
@@ -309,7 +343,7 @@ def search(req: SearchRequest, x_api_key: Optional[str] = Header(default=None)):
 
     key = _cache_key(req.prompt, req.lang)
     _record_access(key, req.prompt, req.lang)
-    is_korean = req.lang == "ko"
+    lang = req.lang
 
     def generate():
         # 아이템 생성(Claude 웹 검색 ~20초)은 별도 스레드에서 큐로 밀어넣고,
@@ -323,12 +357,12 @@ def search(req: SearchRequest, x_api_key: Optional[str] = Header(default=None)):
                 cached = _get_cached_items(key)
                 if cached is not None:
                     for item in cached:
-                        q.put(_enrich(item, is_korean))
+                        q.put(_enrich(item, lang))
                 else:
                     collected = []
                     for item in _claude_items(req.prompt, req.lang):
                         collected.append(item)
-                        q.put(_enrich(item, is_korean))
+                        q.put(_enrich(item, lang))
                     if collected:
                         with _lock:
                             _list_cache[key] = (time.time(), collected)
