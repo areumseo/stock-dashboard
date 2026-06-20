@@ -5,6 +5,7 @@ import time
 import hashlib
 import secrets
 import json
+import queue
 import threading
 import requests
 import anthropic
@@ -311,25 +312,44 @@ def search(req: SearchRequest, x_api_key: Optional[str] = Header(default=None)):
     is_korean = req.lang == "ko"
 
     def generate():
-        try:
-            cached = _get_cached_items(key)
-            if cached is not None:
-                # 캐시 히트: 저장된 리스트 + 실시간 수치 (Claude 호출 없음, 2~3초)
-                for item in cached:
-                    yield _enrich(item, is_korean)
-                return
+        # 아이템 생성(Claude 웹 검색 ~20초)은 별도 스레드에서 큐로 밀어넣고,
+        # 메인 제너레이터는 큐가 조용하면 공백(keepalive)을 흘려보내 연결 유지.
+        # 공백은 앱의 brace 파서가 무시하므로 안전.
+        q: "queue.Queue" = queue.Queue()
+        DONE = object()
 
-            # 캐시 미스: Claude 스트리밍 + 실시간 수치, 완료 후 리스트 캐시 저장
-            collected = []
-            for item in _claude_items(req.prompt, req.lang):
-                collected.append(item)
-                yield _enrich(item, is_korean)
-            if collected:
-                with _lock:
-                    _list_cache[key] = (time.time(), collected)
-        except anthropic.RateLimitError:
-            yield '{"error":"rate_limit"}'
-        except Exception as e:
-            yield f'{{"error":"{str(e)}"}}'
+        def producer():
+            try:
+                cached = _get_cached_items(key)
+                if cached is not None:
+                    for item in cached:
+                        q.put(_enrich(item, is_korean))
+                else:
+                    collected = []
+                    for item in _claude_items(req.prompt, req.lang):
+                        collected.append(item)
+                        q.put(_enrich(item, is_korean))
+                    if collected:
+                        with _lock:
+                            _list_cache[key] = (time.time(), collected)
+            except anthropic.RateLimitError:
+                q.put('{"error":"rate_limit"}')
+            except Exception as e:
+                q.put(json.dumps({"error": str(e)}, ensure_ascii=False))
+            finally:
+                q.put(DONE)
+
+        threading.Thread(target=producer, daemon=True).start()
+
+        yield " "  # 즉시 첫 바이트 → TTFB 단축 + 연결 확립
+        while True:
+            try:
+                payload = q.get(timeout=5)
+            except queue.Empty:
+                yield " "  # keepalive heartbeat
+                continue
+            if payload is DONE:
+                break
+            yield payload
 
     return StreamingResponse(generate(), media_type="text/plain")
