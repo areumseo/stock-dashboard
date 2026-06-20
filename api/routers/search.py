@@ -303,7 +303,9 @@ def _claude_items(prompt: str, lang: str):
     client = anthropic.Anthropic(api_key=api_key)
     buffer = ""
     with client.messages.stream(
-        model="claude-sonnet-4-5",
+        # 수치는 네이버에서 가져오므로 Claude는 리스트+1줄 요약만 담당 → Haiku로 충분.
+        # Sonnet 대비 토큰 단가 약 1/3.
+        model="claude-haiku-4-5-20251001",
         max_tokens=4000,
         system=system,
         messages=[{"role": "user", "content": prompt}],
