@@ -220,8 +220,9 @@ def _fetch_naver_us_metrics(ticker: str, lang: str) -> list[dict]:
 def _fetch_real_metrics(code: str, lang: str) -> list[dict]:
     if not code:
         return []
-    # 6자리 숫자 코드 = 한국 종목, 그 외(알파벳 티커) = 미국 종목
-    if code.isdigit():
+    # 한국 종목 코드는 숫자로 시작(005930, 0195S0 등 알파벳 섞인 ETF 포함),
+    # 미국 티커는 알파벳으로 시작(AAPL, BRK.B). 리딩 문자로 시장 판별.
+    if code[:1].isdigit():
         return _fetch_naver_kr_metrics(code, lang)
     return _fetch_naver_us_metrics(code, lang)
 
