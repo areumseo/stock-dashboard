@@ -354,9 +354,10 @@ def search(req: SearchRequest, x_api_key: Optional[str] = Header(default=None)):
 
     return StreamingResponse(
         generate(),
-        media_type="text/plain",
+        # Render 엣지 프록시는 text/event-stream만 버퍼링하지 않음. 앱의 brace 파서는
+        # content-type과 무관하게 {…}만 추출하므로 SSE content-type이어도 그대로 동작.
+        media_type="text/event-stream",
         headers={
-            # Render/프록시의 응답 버퍼링 비활성화 → 하트비트/카드가 실시간으로 흐름
             "X-Accel-Buffering": "no",
             "Cache-Control": "no-cache",
         },
