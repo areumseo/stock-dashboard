@@ -3,6 +3,7 @@ import time
 import hashlib
 import secrets
 import json
+import requests
 import anthropic
 import yfinance as yf
 from fastapi import APIRouter, HTTPException, Header
@@ -11,6 +12,11 @@ from pydantic import BaseModel
 from typing import Optional
 
 router = APIRouter()
+
+_NAVER_HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Referer": "https://m.stock.naver.com/",
+}
 
 # Claude generates name/code/summary/badge only — no price metrics (yfinance handles those)
 SYSTEM_PROMPT = """You are a stock data API. You MUST respond with raw JSON only — absolutely no prose, no markdown, no backticks, no explanations, no apologies.
@@ -45,14 +51,6 @@ def _set_cache(key: str, data: str) -> None:
 
 # ── yfinance 실시간 메트릭 조회 ───────────────────────────────────────────────
 
-def _fmt_krw(value: float) -> str:
-    if value >= 1e12:
-        return f"₩{value / 1e12:.1f}조"
-    if value >= 1e8:
-        return f"₩{value / 1e8:.0f}억"
-    return f"₩{value:,.0f}"
-
-
 def _fmt_usd_cap(value: float) -> str:
     if value >= 1e12:
         return f"${value / 1e12:.2f}T"
@@ -61,49 +59,77 @@ def _fmt_usd_cap(value: float) -> str:
     return f"${value / 1e6:.0f}M"
 
 
-def _fetch_real_metrics(code: str, is_korean: bool) -> list[dict]:
-    if not code:
-        return []
+def _fetch_naver_metrics(code: str) -> list[dict]:
+    """한국 주식: 네이버 증권 모바일 API (링크 클릭 시 보이는 화면과 동일 수치)."""
     try:
-        if is_korean:
-            ticker = None
-            for suffix in [".KS", ".KQ"]:
-                t = yf.Ticker(code + suffix)
-                fi = t.fast_info
-                if fi.last_price:
-                    ticker = t
-                    break
-            if ticker is None:
-                return []
-        else:
-            ticker = yf.Ticker(code)
+        basic = requests.get(
+            f"https://m.stock.naver.com/api/stock/{code}/basic",
+            headers=_NAVER_HEADERS, timeout=4,
+        ).json()
+    except Exception:
+        return []
 
-        fi = ticker.fast_info
+    metrics = []
+
+    close = basic.get("closePrice")
+    ratio = basic.get("fluctuationsRatio")
+    direction = (basic.get("compareToPreviousPrice") or {}).get("name")  # RISING/FALLING
+    up = direction == "RISING"
+
+    if close:
+        metrics.append({"label": "현재가", "value": f"₩{close}", "positive": None})
+
+    if ratio not in (None, ""):
+        sign = "+" if not str(ratio).startswith("-") else ""
+        metrics.append({"label": "등락률", "value": f"{sign}{ratio}%", "positive": up})
+
+    # 시가총액은 integration 엔드포인트에서
+    try:
+        integ = requests.get(
+            f"https://m.stock.naver.com/api/stock/{code}/integration",
+            headers=_NAVER_HEADERS, timeout=4,
+        ).json()
+        for info in integ.get("totalInfos", []):
+            if info.get("code") == "marketValue":
+                metrics.append(
+                    {"label": "시가총액", "value": info.get("value", "N/A"), "positive": None}
+                )
+                break
+    except Exception:
+        pass
+
+    return metrics
+
+
+def _fetch_yfinance_metrics(code: str) -> list[dict]:
+    """미국 주식: yfinance."""
+    try:
+        fi = yf.Ticker(code).fast_info
         metrics = []
-
         price = fi.last_price
         prev_close = fi.previous_close
         market_cap = fi.market_cap
 
         if price:
-            label = "현재가" if is_korean else "Price"
-            value = f"₩{price:,.0f}" if is_korean else f"${price:,.2f}"
-            metrics.append({"label": label, "value": value, "positive": None})
+            metrics.append({"label": "Price", "value": f"${price:,.2f}", "positive": None})
 
         if price and prev_close and prev_close > 0:
             chg = (price - prev_close) / prev_close * 100
             sign = "+" if chg >= 0 else ""
-            label = "등락률" if is_korean else "Change"
-            metrics.append({"label": label, "value": f"{sign}{chg:.2f}%", "positive": chg >= 0})
+            metrics.append({"label": "Change", "value": f"{sign}{chg:.2f}%", "positive": chg >= 0})
 
         if market_cap:
-            label = "시가총액" if is_korean else "Mkt Cap"
-            value = _fmt_krw(market_cap) if is_korean else _fmt_usd_cap(market_cap)
-            metrics.append({"label": label, "value": value, "positive": None})
+            metrics.append({"label": "Mkt Cap", "value": _fmt_usd_cap(market_cap), "positive": None})
 
         return metrics
     except Exception:
         return []
+
+
+def _fetch_real_metrics(code: str, is_korean: bool) -> list[dict]:
+    if not code:
+        return []
+    return _fetch_naver_metrics(code) if is_korean else _fetch_yfinance_metrics(code)
 
 
 # ── 스트리밍 버퍼에서 완성된 item 추출 (Flutter의 brace-counter와 동일 로직) ──
