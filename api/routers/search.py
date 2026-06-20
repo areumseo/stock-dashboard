@@ -352,4 +352,12 @@ def search(req: SearchRequest, x_api_key: Optional[str] = Header(default=None)):
                 break
             yield payload
 
-    return StreamingResponse(generate(), media_type="text/plain")
+    return StreamingResponse(
+        generate(),
+        media_type="text/plain",
+        headers={
+            # Render/프록시의 응답 버퍼링 비활성화 → 하트비트/카드가 실시간으로 흐름
+            "X-Accel-Buffering": "no",
+            "Cache-Control": "no-cache",
+        },
+    )
