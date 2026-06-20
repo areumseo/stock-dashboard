@@ -29,7 +29,9 @@ Your FIRST character must be { and your LAST character must be }.
 
 Schema: {"items":[{"name":"string","code":"string","summary":"1 sentence: recent news + key investment point","badge":"string","badgeType":"up|new|lev|down"}]}
 
-Rules: items≤20. Use the exact ticker code (e.g. 005930 for Samsung, AAPL for Apple). Do NOT include metrics — they are fetched separately."""
+Rules: items≤20. Use the exact ticker code (e.g. 005930 for Samsung, AAPL for Apple). Do NOT include metrics — they are fetched separately.
+
+IMPORTANT: ALWAYS return a useful list — never an empty "items" array. You do NOT need exact figures (price/return/AUM are added later from another source), so even if web data is sparse, list well-known matching tickers from your own knowledge. If the request is too specific to fill exactly, return the closest well-known matches rather than nothing. Aim for the requested count."""
 
 # ── 2단 캐시 (B′) ──────────────────────────────────────────────────────────────
 # 비싼 Claude 결과(종목 리스트+요약)는 길게 캐시하고, 가격 수치는 매 요청마다 실시간으로
