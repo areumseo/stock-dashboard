@@ -327,12 +327,18 @@ def _claude_items_model(prompt: str, lang: str, model: str):
 
 
 def _claude_items(prompt: str, lang: str):
-    """Haiku로 먼저 시도, 0개면 Sonnet으로 폴백. (어려운 ETF 검색 안정성 확보)"""
+    """모델 선택: ETF/레버리지 검색은 Haiku가 빈 배열을 자주 반환하므로 Sonnet 직행.
+    그 외(시총 등)는 Haiku로 싸게 처리하되, 0개면 Sonnet으로 폴백."""
+    use_sonnet = "ETF" in prompt.upper()
+    model = MODEL_FALLBACK if use_sonnet else MODEL_PRIMARY
+
     count = 0
-    for item in _claude_items_model(prompt, lang, MODEL_PRIMARY):
+    for item in _claude_items_model(prompt, lang, model):
         count += 1
         yield item
-    if count == 0:
+
+    # Haiku로 처리했는데 0개면 Sonnet 폴백 (예상 못 한 케이스 대비)
+    if count == 0 and model == MODEL_PRIMARY:
         for item in _claude_items_model(prompt, lang, MODEL_FALLBACK):
             yield item
 
